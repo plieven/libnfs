@@ -28,6 +28,9 @@
 #if defined(AROS)
 #include <sys/time.h>
 #endif
+#if defined(__APPLE__) && defined(__MACH__)
+#include <sys/time.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -322,13 +325,15 @@ EXTERN int nfs_fstat(struct nfs_context *nfs, struct nfsfh *nfsfh, struct stat *
 /*
  * Async open(<filename>)
  *
- * mode is a combination of the flags : O_RDOLNY, O_WRONLY, O_RDWR , O_SYNC
+ * mode is a combination of the flags :
+ * O_RDOLNY, O_WRONLY, O_RDWR , O_SYNC, O_APPEND
  *
  * Function returns
  *  0 : The operation was initiated. Once the operation finishes, the callback will be invoked.
  * <0 : An error occured when trying to set up the operation. The callback will not be invoked.
  *
  * Supported flags are
+ * O_APPEND
  * O_RDONLY
  * O_WRONLY
  * O_RDWR
@@ -504,14 +509,14 @@ EXTERN int nfs_write(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t coun
  * -errno : An error occured.
  *          data is the error string.
  */
-EXTERN int nfs_lseek_async(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset, int whence, nfs_cb cb, void *private_data);
+EXTERN int nfs_lseek_async(struct nfs_context *nfs, struct nfsfh *nfsfh, int64_t offset, int whence, nfs_cb cb, void *private_data);
 /*
  * Sync lseek()
  * Function returns
  *    >=0 : numer of bytes read.
  * -errno : An error occured.
  */
-EXTERN int nfs_lseek(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset, int whence, uint64_t *current_offset);
+EXTERN int nfs_lseek(struct nfs_context *nfs, struct nfsfh *nfsfh, int64_t offset, int whence, uint64_t *current_offset);
 
 
 /*
