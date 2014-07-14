@@ -1,7 +1,10 @@
 /*
    Copyright (C) 2010 by Ronnie Sahlberg <ronniesahlberg@gmail.com>
 
-
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation; either version 2.1 of the License, or
+   (at your option) any later version.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -241,7 +244,7 @@ void rpc_destroy_context(struct rpc_context *rpc)
 
 	while((pdu = rpc->outqueue.head) != NULL) {
 		pdu->cb(rpc, RPC_STATUS_CANCEL, NULL, pdu->private_data);
-		rpc->outqueue.head = pdu->next;
+		LIBNFS_LIST_REMOVE(&rpc->outqueue.head, pdu);
 		rpc_free_pdu(rpc, pdu);
 	}
 
@@ -250,7 +253,7 @@ void rpc_destroy_context(struct rpc_context *rpc)
 
 		while((pdu = q->head) != NULL) {
 			pdu->cb(rpc, RPC_STATUS_CANCEL, NULL, pdu->private_data);
-			rpc->outqueue.head = pdu->next;
+			LIBNFS_LIST_REMOVE(&q->head, pdu);
 			rpc_free_pdu(rpc, pdu);
 		}
 	}

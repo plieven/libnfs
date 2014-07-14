@@ -69,6 +69,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include "libnfs-zdr.h"
+#include "slist.h"
 #include "libnfs.h"
 #include "libnfs-raw.h"
 #include "libnfs-raw-mount.h"
@@ -76,7 +77,13 @@
 #include "libnfs-raw-portmap.h"
 #include "libnfs-private.h"
 
+#define MAX_DIR_CACHE 128
+
 struct nfsdir {
+       struct nfs_fh3 fh;
+       fattr3 attr;
+       struct nfsdir *next;
+
        struct nfsdirent *entries;
        struct nfsdirent *current;
 };
@@ -107,6 +114,7 @@ struct nfs_context {
        uint64_t readmax;
        uint64_t writemax;
        char *cwd;
+       struct nfsdir *dircache;
 };
 
 void nfs_free_nfsdir(struct nfsdir *nfsdir)
@@ -119,11 +127,42 @@ void nfs_free_nfsdir(struct nfsdir *nfsdir)
 		free(nfsdir->entries);
 		nfsdir->entries = dirent;
 	}
+	free(nfsdir->fh.data.data_val);
 	free(nfsdir);
 }
 
+static void nfs_dircache_add(struct nfs_context *nfs, struct nfsdir *nfsdir)
+{
+	int i;
+	LIBNFS_LIST_ADD(&nfs->dircache, nfsdir);
+
+	for (nfsdir = nfs->dircache, i = 0; nfsdir; nfsdir = nfsdir->next, i++) {
+		if (i > MAX_DIR_CACHE) {
+			LIBNFS_LIST_REMOVE(&nfs->dircache, nfsdir);
+			nfs_free_nfsdir(nfsdir);
+			break;
+		}
+	}
+}
+
+static struct nfsdir *nfs_dircache_find(struct nfs_context *nfs, struct nfs_fh3 *fh)
+{
+	struct nfsdir *nfsdir;
+
+	for (nfsdir = nfs->dircache; nfsdir; nfsdir = nfsdir->next) {
+		if (nfsdir->fh.data.data_len == fh->data.data_len &&
+		    !memcmp(nfsdir->fh.data.data_val, fh->data.data_val, fh->data.data_len)) {
+			LIBNFS_LIST_REMOVE(&nfs->dircache, nfsdir);
+			return nfsdir;
+		}
+	}
+
+	return NULL;
+}
+
 struct nfs_cb_data;
-typedef int (*continue_func)(struct nfs_context *nfs, struct nfs_cb_data *data);
+typedef int (*continue_func)(struct nfs_context *nfs, fattr3 *attr,
+			     struct nfs_cb_data *data);
 
 struct nfs_cb_data {
        struct nfs_context *nfs;
@@ -157,7 +196,7 @@ struct nfs_mcb_data {
        int update_pos;
 };
 
-static int nfs_lookup_path_async_internal(struct nfs_context *nfs, struct nfs_cb_data *data, struct nfs_fh3 *fh);
+static int nfs_lookup_path_async_internal(struct nfs_context *nfs, fattr3 *attr, struct nfs_cb_data *data, struct nfs_fh3 *fh);
 
 void nfs_set_auth(struct nfs_context *nfs, struct AUTH *auth)
 {
@@ -388,6 +427,12 @@ void nfs_destroy_context(struct nfs_context *nfs)
 	if (nfs->rootfh.data.data_val != NULL) {
 		free(nfs->rootfh.data.data_val);
 		nfs->rootfh.data.data_val = NULL;
+	}
+
+	while (nfs->dircache) {
+		struct nfsdir *nfsdir = nfs->dircache;
+		LIBNFS_LIST_REMOVE(&nfs->dircache, nfsdir);
+		nfs_free_nfsdir(nfsdir);
 	}
 
 	free(nfs);
@@ -652,9 +697,6 @@ static void free_nfs_cb_data(struct nfs_cb_data *data)
 }
 
 
-
-
-
 static void nfs_mount_10_cb(struct rpc_context *rpc, int status, void *command_data, void *private_data)
 {
 	struct nfs_cb_data *data = private_data;
@@ -860,6 +902,7 @@ static void nfs_lookup_path_1_cb(struct rpc_context *rpc, int status, void *comm
 	struct nfs_cb_data *data = private_data;
 	struct nfs_context *nfs = data->nfs;
 	LOOKUP3res *res;
+	fattr3 *attr;
 
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
@@ -882,15 +925,17 @@ static void nfs_lookup_path_1_cb(struct rpc_context *rpc, int status, void *comm
 		return;
 	}
 
-	if (nfs_lookup_path_async_internal(nfs, data, &res->LOOKUP3res_u.resok.object) != 0) {
-		rpc_set_error(nfs->rpc, "Failed to create lookup pdu");
-		data->cb(-ENOMEM, nfs, rpc_get_error(nfs->rpc), data->private_data);
-		free_nfs_cb_data(data);
-		return;
-	}
+	attr = res->LOOKUP3res_u.resok.obj_attributes.attributes_follow ?
+	  &res->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes :
+	  NULL;
+
+	/* This function will always invoke the callback and cleanup
+	 * for failures. So no need to check the return value.
+	 */
+	nfs_lookup_path_async_internal(nfs, attr, data, &res->LOOKUP3res_u.resok.object);
 }
 
-static int nfs_lookup_path_async_internal(struct nfs_context *nfs, struct nfs_cb_data *data, struct nfs_fh3 *fh)
+static int nfs_lookup_path_async_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data, struct nfs_fh3 *fh)
 {
 	char *path, *slash;
 	LOOKUP3args args;
@@ -929,10 +974,9 @@ static int nfs_lookup_path_async_internal(struct nfs_context *nfs, struct nfs_cb
 		if (slash != NULL) {
 			*slash = '/';
 		}
-		data->continue_cb(nfs, data);
+		data->continue_cb(nfs, attr, data);
 		return 0;
 	}
-
 
 	memset(&args, 0, sizeof(LOOKUP3args));
 	args.what.dir = *fh;
@@ -1050,9 +1094,45 @@ static int nfs_normalize_path(struct nfs_context *nfs, char *path)
 	return 0;
 }
 
+static void nfs_lookup_path_getattr_cb(struct rpc_context *rpc, int status, void *command_data, void *private_data)
+{
+	struct nfs_cb_data *data = private_data;
+	struct nfs_context *nfs = data->nfs;
+	GETATTR3res *res;
+	fattr3 *attr;
+
+	assert(rpc->magic == RPC_CONTEXT_MAGIC);
+
+	if (status == RPC_STATUS_ERROR) {
+		data->cb(-EFAULT, nfs, command_data, data->private_data);
+		free_nfs_cb_data(data);
+		return;
+	}
+	if (status == RPC_STATUS_CANCEL) {
+		data->cb(-EINTR, nfs, "Command was cancelled", data->private_data);
+		free_nfs_cb_data(data);
+		return;
+	}
+
+	res = command_data;
+	if (res->status != NFS3_OK) {
+		rpc_set_error(nfs->rpc, "NFS: GETATTR of %s failed with %s(%d)", data->saved_path, nfsstat3_to_str(res->status), nfsstat3_to_errno(res->status));
+		data->cb(nfsstat3_to_errno(res->status), nfs, rpc_get_error(nfs->rpc), data->private_data);
+		free_nfs_cb_data(data);
+		return;
+	}
+
+	attr = &res->GETATTR3res_u.resok.obj_attributes;
+	/* This function will always invoke the callback and cleanup
+	 * for failures. So no need to check the return value.
+	 */
+	nfs_lookup_path_async_internal(nfs, attr, data, &nfs->rootfh);
+}
+
 static int nfs_lookuppath_async(struct nfs_context *nfs, const char *path, nfs_cb cb, void *private_data, continue_func continue_cb, void *continue_data, void (*free_continue_data)(void *), int continue_int)
 {
 	struct nfs_cb_data *data;
+	struct GETATTR3args args;
 
 	if (path[0] == '\0') {
 		path = ".";
@@ -1098,16 +1178,25 @@ static int nfs_lookuppath_async(struct nfs_context *nfs, const char *path, nfs_c
 	}
 
 	data->path = data->saved_path;
-
-	if (nfs_lookup_path_async_internal(nfs, data, &nfs->rootfh) != 0) {
-		/* return 0 here since the callback will be invoked if there is a failure */
+	if (data->path[0]) {
+		/* This function will always invoke the callback and cleanup
+		 * for failures. So no need to check the return value.
+		 */
+		nfs_lookup_path_async_internal(nfs, NULL, data, &nfs->rootfh);
 		return 0;
+	}
+
+	/* We have a request for "", so just perform a GETATTR3 so we can
+	 * return the attributes to the caller.
+	 */
+	memset(&args, 0, sizeof(GETATTR3args));
+	args.object = nfs->rootfh;
+	if (rpc_nfs3_getattr_async(nfs->rpc, nfs_lookup_path_getattr_cb, &args, data) != 0) {
+		free_nfs_cb_data(data);
+		return -1;
 	}
 	return 0;
 }
-
-
-
 
 
 /*
@@ -1171,7 +1260,7 @@ static void nfs_stat_1_cb(struct rpc_context *rpc, int status, void *command_dat
 	free_nfs_cb_data(data);
 }
 
-static int nfs_stat_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_stat_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	struct GETATTR3args args;
 
@@ -1251,7 +1340,7 @@ static void nfs_stat64_1_cb(struct rpc_context *rpc, int status, void *command_d
 	free_nfs_cb_data(data);
 }
 
-static int nfs_stat64_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_stat64_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	struct GETATTR3args args;
 
@@ -1431,7 +1520,7 @@ static void nfs_open_cb(struct rpc_context *rpc, int status, void *command_data,
 	free_nfs_cb_data(data);
 }
 
-static int nfs_open_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_open_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	int nfsmode = 0;
 	ACCESS3args args;
@@ -1475,7 +1564,7 @@ int nfs_open_async(struct nfs_context *nfs, const char *path, int flags, nfs_cb 
 /*
  * Async chdir()
  */
-static int nfs_chdir_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_chdir_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	/* steal saved_path */
 	free(nfs->cwd);
@@ -2224,7 +2313,7 @@ int nfs_ftruncate_async(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t l
 /*
  * Async truncate()
  */
-static int nfs_truncate_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_truncate_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	uint64_t offset = data->continue_int;
 	struct nfsfh nfsfh;
@@ -2295,7 +2384,7 @@ static void nfs_mkdir_cb(struct rpc_context *rpc, int status, void *command_data
 	free_nfs_cb_data(data);
 }
 
-static int nfs_mkdir_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_mkdir_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	char *str = data->continue_data;
 	MKDIR3args args;
@@ -2386,7 +2475,7 @@ static void nfs_rmdir_cb(struct rpc_context *rpc, int status, void *command_data
 	free_nfs_cb_data(data);
 }
 
-static int nfs_rmdir_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_rmdir_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	char *str = data->continue_data;
 	RMDIR3args args;
@@ -2531,7 +2620,7 @@ static void nfs_creat_1_cb(struct rpc_context *rpc, int status, void *command_da
 	return;
 }
 
-static int nfs_creat_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_creat_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	char *str = data->continue_data;
 	CREATE3args args;
@@ -2622,7 +2711,7 @@ static void nfs_unlink_cb(struct rpc_context *rpc, int status, void *command_dat
 	free_nfs_cb_data(data);
 }
 
-static int nfs_unlink_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_unlink_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	char *str = data->continue_data;
 	struct REMOVE3args args;
@@ -2721,7 +2810,7 @@ static void nfs_mknod_cb(struct rpc_context *rpc, int status, void *command_data
 	free_nfs_cb_data(data);
 }
 
-static int nfs_mknod_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_mknod_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	struct mknod_cb_data *cb_data = data->continue_data;
 	char *str = cb_data->path;
@@ -2869,6 +2958,7 @@ static void nfs_opendir3_cb(struct rpc_context *rpc, int status, void *command_d
 			nfsdirent->ctime.tv_usec = attributes->ctime.nseconds/1000;
 			nfsdirent->uid = attributes->uid;
 			nfsdirent->gid = attributes->gid;
+			nfsdirent->nlink = attributes->nlink;
 		}
 	}
 
@@ -2974,6 +3064,9 @@ static void nfs_opendir2_cb(struct rpc_context *rpc, int status, void *command_d
 		}
 		return;
 	}
+
+	if (res->READDIR3res_u.resok.dir_attributes.attributes_follow)
+		nfsdir->attr = res->READDIR3res_u.resok.dir_attributes.post_op_attr_u.attributes;
 
 	/* steal the dirhandle */
 	nfsdir->current = nfsdir->entries;
@@ -3106,6 +3199,7 @@ static void nfs_opendir_cb(struct rpc_context *rpc, int status, void *command_da
 			nfsdirent->ctime.tv_usec = entry->name_attributes.post_op_attr_u.attributes.ctime.nseconds/1000;
 			nfsdirent->uid = entry->name_attributes.post_op_attr_u.attributes.uid;
 			nfsdirent->gid = entry->name_attributes.post_op_attr_u.attributes.gid;
+			nfsdirent->nlink = entry->name_attributes.post_op_attr_u.attributes.nlink;
 		}
 
 		nfsdirent->next  = nfsdir->entries;
@@ -3135,6 +3229,9 @@ static void nfs_opendir_cb(struct rpc_context *rpc, int status, void *command_da
 		return;
 	}
 
+	if (res->READDIRPLUS3res_u.resok.dir_attributes.attributes_follow)
+		nfsdir->attr = res->READDIRPLUS3res_u.resok.dir_attributes.post_op_attr_u.attributes;
+
 	/* steal the dirhandle */
 	data->continue_data = NULL;
 	nfsdir->current = nfsdir->entries;
@@ -3143,9 +3240,34 @@ static void nfs_opendir_cb(struct rpc_context *rpc, int status, void *command_da
 	free_nfs_cb_data(data);
 }
 
-static int nfs_opendir_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_opendir_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	READDIRPLUS3args args;
+	struct nfsdir *nfsdir = data->continue_data;;
+	struct nfsdir *cached;
+
+	cached = nfs_dircache_find(nfs, &data->fh);
+	if (cached) {
+		if (attr && attr->mtime.seconds == cached->attr.mtime.seconds) {
+			cached->current = cached->entries;
+			data->cb(0, nfs, cached, data->private_data);
+			free_nfs_cb_data(data);
+			return 0;
+		} else {
+			/* cache must be stale */
+			nfs_free_nfsdir(cached);
+		}
+	}
+
+	nfsdir->fh.data.data_len  = data->fh.data.data_len;
+	nfsdir->fh.data.data_val = malloc(nfsdir->fh.data.data_len);
+	if (nfsdir->fh.data.data_val == NULL) {
+		rpc_set_error(nfs->rpc, "OOM when allocating fh for nfsdir");
+		data->cb(-ENOMEM, nfs, rpc_get_error(nfs->rpc), data->private_data);
+		free_nfs_cb_data(data);
+		return -1;
+	}
+	memcpy(nfsdir->fh.data.data_val, data->fh.data.data_val, data->fh.data.data_len);
 
 	args.dir = data->fh;
 	args.cookie = 0;
@@ -3195,9 +3317,9 @@ struct nfsdirent *nfs_readdir(struct nfs_context *nfs _U_, struct nfsdir *nfsdir
 /*
  * closedir()
  */
-void nfs_closedir(struct nfs_context *nfs _U_, struct nfsdir *nfsdir)
+void nfs_closedir(struct nfs_context *nfs, struct nfsdir *nfsdir)
 {
-	nfs_free_nfsdir(nfsdir);
+	nfs_dircache_add(nfs, nfsdir);
 }
 
 
@@ -3364,7 +3486,7 @@ static void nfs_statvfs_1_cb(struct rpc_context *rpc, int status, void *command_
 	free_nfs_cb_data(data);
 }
 
-static int nfs_statvfs_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_statvfs_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	FSSTAT3args args;
 
@@ -3426,7 +3548,7 @@ static void nfs_readlink_1_cb(struct rpc_context *rpc, int status, void *command
 	free_nfs_cb_data(data);
 }
 
-static int nfs_readlink_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_readlink_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	READLINK3args args;
 
@@ -3488,7 +3610,7 @@ static void nfs_chmod_cb(struct rpc_context *rpc, int status, void *command_data
 	free_nfs_cb_data(data);
 }
 
-static int nfs_chmod_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_chmod_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	SETATTR3args args;
 
@@ -3543,7 +3665,7 @@ int nfs_fchmod_async(struct nfs_context *nfs, struct nfsfh *nfsfh, int mode, nfs
 	}
 	memcpy(data->fh.data.data_val, nfsfh->fh.data.data_val, data->fh.data.data_len);
 
-	if (nfs_chmod_continue_internal(nfs, data) != 0) {
+	if (nfs_chmod_continue_internal(nfs, NULL, data) != 0) {
 		return -1;
 	}
 
@@ -3591,7 +3713,7 @@ struct nfs_chown_data {
        gid_t gid;
 };
 
-static int nfs_chown_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_chown_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	SETATTR3args args;
 	struct nfs_chown_data *chown_data = data->continue_data;
@@ -3677,7 +3799,7 @@ int nfs_fchown_async(struct nfs_context *nfs, struct nfsfh *nfsfh, int uid, int 
 	}
 	memcpy(data->fh.data.data_val, nfsfh->fh.data.data_val, data->fh.data.data_len);
 
-	if (nfs_chown_continue_internal(nfs, data) != 0) {
+	if (nfs_chown_continue_internal(nfs, NULL, data) != 0) {
 		return -1;
 	}
 
@@ -3722,7 +3844,7 @@ static void nfs_utimes_cb(struct rpc_context *rpc, int status, void *command_dat
 	free_nfs_cb_data(data);
 }
 
-static int nfs_utimes_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_utimes_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	SETATTR3args args;
 	struct timeval *utimes_data = data->continue_data;
@@ -3860,7 +3982,7 @@ static void nfs_access_cb(struct rpc_context *rpc, int status, void *command_dat
 	free_nfs_cb_data(data);
 }
 
-static int nfs_access_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_access_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	int nfsmode = 0;
 	ACCESS3args args;
@@ -3957,7 +4079,7 @@ static void nfs_symlink_cb(struct rpc_context *rpc, int status, void *command_da
 	free_nfs_cb_data(data);
 }
 
-static int nfs_symlink_continue_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_symlink_continue_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	struct nfs_symlink_data *symlink_data = data->continue_data;
 	SYMLINK3args args;
@@ -4093,7 +4215,7 @@ static void nfs_rename_cb(struct rpc_context *rpc, int status, void *command_dat
 	free_nfs_cb_data(data);
 }
 
-static int nfs_rename_continue_2_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_rename_continue_2_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	struct nfs_rename_data *rename_data = data->continue_data;
 	RENAME3args args;
@@ -4116,7 +4238,7 @@ static int nfs_rename_continue_2_internal(struct nfs_context *nfs, struct nfs_cb
 }
 
 
-static int nfs_rename_continue_1_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_rename_continue_1_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	struct nfs_rename_data *rename_data = data->continue_data;
 	char* newpath = strdup(rename_data->newpath);
@@ -4263,7 +4385,7 @@ static void nfs_link_cb(struct rpc_context *rpc, int status, void *command_data,
 	free_nfs_cb_data(data);
 }
 
-static int nfs_link_continue_2_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_link_continue_2_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	struct nfs_link_data *link_data = data->continue_data;
 	LINK3args args;
@@ -4286,7 +4408,7 @@ static int nfs_link_continue_2_internal(struct nfs_context *nfs, struct nfs_cb_d
 }
 
 
-static int nfs_link_continue_1_internal(struct nfs_context *nfs, struct nfs_cb_data *data)
+static int nfs_link_continue_1_internal(struct nfs_context *nfs, fattr3 *attr _U_, struct nfs_cb_data *data)
 {
 	struct nfs_link_data *link_data = data->continue_data;
 
